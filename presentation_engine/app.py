@@ -29,6 +29,7 @@ from layout_engine import (
     split_text_to_fit,
     validate_rect,
 )
+from layout_catalog import get_layout_pattern
 from source_analysis import analyze_slide, choose_source_template
 from utils import create_qr, safe_fit_image
 
@@ -493,6 +494,7 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
         })
         semantic_choice = LayoutGridEngine.analyze_and_score_source(result[-1])
         result[-1]["semantic_layout"] = semantic_choice
+        result[-1]["layout_plan"] = get_layout_pattern(semantic_choice["template_id"])
         if not tables and not images and slide_type != "title_root":
             semantic_kind = {
                 "A": "code_dark_ide" if index % 2 == 0 else "code_light_ide",
