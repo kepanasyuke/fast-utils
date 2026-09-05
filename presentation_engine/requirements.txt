@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-pptx
+python-multipart
+requests
+rembg
+pillow
+onnxruntime
+qrcode

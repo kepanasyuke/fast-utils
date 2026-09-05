@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+generated_*.pptx
+generated_presentations/*.pptx
