@@ -27,6 +27,7 @@ from layout_engine import (
     split_text_to_fit,
     validate_rect,
 )
+from source_analysis import analyze_slide, choose_source_template
 
 
 app = FastAPI(title="AI Presentation Brand Engine")
@@ -183,6 +184,7 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
 
     result = []
     for index, slide in enumerate(presentation.slides):
+        source_profile = analyze_slide(slide)
         lines = []
         tables = []
         images = []
@@ -219,6 +221,7 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
         body = "\n".join(blocks).strip() or title
         lower = f"{title} {body}".lower()
         educational_type = classify_educational_slide(title, body, blocks)
+        source_type = choose_source_template(source_profile, title, body)
         if index == 0 and len(body) < 180 and not tables and not images:
             slide_type = "title_root"
         elif tables:
@@ -227,6 +230,8 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
             slide_type = "image_collage"
         elif images:
             slide_type = "image_story"
+        elif source_type != "auto":
+            slide_type = source_type
         elif educational_type:
             slide_type = educational_type
         elif looks_like_flowchart(lower, blocks):
@@ -259,6 +264,7 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
             "table": tables[0] if tables else [],
             "tables": tables,
             "images": images,
+            "source_profile": source_profile,
         })
     return result
 
