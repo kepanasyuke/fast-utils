@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import io
 import os
+import random
 import re
 import uuid
 from pathlib import Path
 
+import qrcode
+import requests
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
@@ -37,6 +40,14 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 SLIDE_WIDTH = Inches(13.333)
 SLIDE_HEIGHT = Inches(7.5)
 SLIDE_CANVAS = Rect(0, 0, 13.333, 7.5)
+WHITE_SPACE_TARGET = 0.70
+HEADER_ZONE = (1.0, 0.4, 11.333, 1.0)
+HR_ZONE = (1.0, 1.3, 11.333, 0.02)
+SAFE_ZONES = {
+    "left": (1.0, 1.8, 5.8, 4.5),
+    "right": (7.6, 1.8, 4.733, 4.5),
+    "center": (1.666, 1.8, 10.0, 4.5),
+}
 FONT_HEADER = FONTS["header"]
 FONT_BODY = FONTS["body"]
 FONT_CODE = FONTS["code"]
@@ -55,7 +66,63 @@ PALETTES = {
     "ruby_red": RGBColor(225, 29, 72),
     "git_orange": RGBColor(249, 115, 22),
     "ai_purple": RGBColor(139, 92, 246),
+    "pascal_blue": RGBColor(29, 78, 216),
+    "terminal_dark": RGBColor(30, 41, 59),
+    "dracula_pink": RGBColor(236, 72, 153),
+    "vscode_blue": RGBColor(0, 122, 204),
+    "github_gray": RGBColor(36, 41, 46),
 }
+COLOR_PALETTES = PALETTES
+
+COLOR_WHITE = WHITE
+COLOR_TEXT_DARK = TEXT
+COLOR_TEXT_MUTED = MUTED
+COLOR_CODE_BG = LIGHT
+COLOR_BORDER_LIGHT = BORDER
+COLOR_TERMINAL_BG = TERMINAL
+COLOR_TIMER_RED = RGBColor(239, 68, 68)
+COLOR_YANDEX_BLUE = RGBColor(0, 114, 239)
+
+CHARACTER_LIBRARY = [
+    {"name": "ИИ-Робот", "url": "https://popsy.co"},
+    {"name": "Разработчик", "url": "https://popsy.co"},
+    {"name": "Кодер-исследователь", "url": "https://popsy.co"},
+    {"name": "Проектировщик ИИ", "url": "https://popsy.co"},
+]
+RUSSIAN_BUBBLES = [
+    "Проверьте входные данные перед запуском алгоритма.",
+    "Разбейте сложную задачу на последовательность простых шагов.",
+    "Отступы и структура кода важнее случайных исправлений.",
+    "Сначала сформулируйте условие, затем выбирайте алгоритм.",
+    "Таблица помогает увидеть закономерность быстрее текста.",
+    "Сохраняйте промежуточный результат, чтобы проверить ход решения.",
+    "Одна понятная схема лучше длинного списка исключений.",
+    "Сравните результат с ожидаемым примером.",
+    "Названия переменных должны объяснять смысл данных.",
+    "Информация становится полезной после правильной обработки.",
+]
+KEYWORDS_TO_BOLD = [
+    "презентац", "слайд", "шаблон", "дизайн", "макет", "гиперссылк", "анимац", "мультимеди",
+    "программ", "процессор", "память", "бит", "байт", "код", "алгоритм", "цикл", "переменн",
+    "массив", "компиля", "интерпрета", "логик", "истин", "ложь", "таблиц", "граф", "дерево",
+    "файл", "папк", "каталог", "вирус", "парол", "защит", "интернет", "сервер", "клиент",
+    "браузер", "сайт", "протокол", "систем", "данн", "информац", "процесс", "хранен", "передач",
+    "сбор", "обработк", "представлен", "кодирован", "декодирован", "алфавит", "символ", "знак",
+    "язык", "текст", "документ", "формат", "абзац", "шрифт", "табуляц", "список", "маркер",
+    "изображен", "рисунок", "фотограф", "пиктограмм", "цвет", "контраст", "разрешен", "пиксел",
+    "график", "диаграмм", "формул", "величин", "измерен", "количеств", "единиц", "разряд",
+    "двоичн", "десятичн", "счислен", "слово", "команд", "оператор", "услови", "ветвлен",
+    "функци", "метод", "параметр", "аргумент", "тип", "строк", "числ", "логическ", "ошибк",
+    "отладк", "тест", "провер", "результат", "ввод", "вывод", "пользовател", "интерфейс",
+    "окно", "кнопк", "меню", "сеть", "адрес", "маршрут", "роутер", "облак", "сервис",
+    "сообщен", "электрон", "почт", "ссылк", "поиск", "запрос", "баз", "данных", "запис",
+    "поле", "строк", "столбец", "отношен", "безопас", "резерв", "копирован", "носител", "диск",
+    "флеш", "оптическ", "магнит", "операцион", "сред", "драйвер", "устройств", "монитор", "клавиатур",
+    "мышь", "принтер", "сканер", "микрофон", "видео", "аудио", "мультимедийн", "виртуаль", "цифров",
+    "учебник", "задан", "вопрос", "ответ", "практик", "пример", "решен", "этап", "шаг", "последовательн",
+    "план", "структур", "сравнен", "определен", "термин", "понят", "свойств", "объект", "явлен", "действ",
+    "состояни", "модел", "схем", "соединител", "блок", "условн", "начал", "конец", "стрелк", "узел",
+]
 
 
 class LayoutGridEngine:
@@ -79,8 +146,16 @@ class LayoutGridEngine:
     TIMELINE_MARKERS = ("этап", "шаг", "последовательность", "году", "в 19", "в 20")
 
     @classmethod
-    def analyze_and_score_source(cls, slide_data: dict) -> dict[str, object]:
-        """Вернуть scores, класс и конкретный ID из 60 шаблонов."""
+    def analyze_and_score_source(cls, slide_data: dict | str, body_text: str | None = None):
+        """Вернуть подробный scoring или публичную метку макета.
+
+        Внешний вызов ``analyze_and_score_source(title, body)`` возвращает
+        требуемую метку, внутренний вызов со словарём возвращает diagnostics.
+        """
+
+        public_call = isinstance(slide_data, str)
+        if public_call:
+            slide_data = {"title": slide_data, "body": body_text or ""}
 
         body = str(slide_data.get("full_body", slide_data.get("body", "")))
         title = str(slide_data.get("title", ""))
@@ -130,7 +205,7 @@ class LayoutGridEngine:
         variation = (fingerprint + int(slide_data.get("source_index", 0))) % 12
         template_id = cls.CLASSES[winning_class][variation]
         index = int(slide_data.get("source_index", 0))
-        return {
+        result = {
             "scores": scores,
             "evidence": evidence,
             "class": winning_class,
@@ -139,6 +214,15 @@ class LayoutGridEngine:
             "mode": "mirror-dark" if index % 2 == 0 else "direct-light",
             "safe_zones": cls.SAFE_ZONES,
         }
+        if public_call:
+            return {
+                "A": "code_ide",
+                "B": "yandex_quiz",
+                "C": "focus_definition",
+                "D": "step_timeline",
+                "E": "hero_banner",
+            }[winning_class]
+        return result
 
     @classmethod
     def apply_semantic_choice(cls, slide_data: dict) -> dict:
@@ -161,6 +245,58 @@ class LayoutGridEngine:
 
 def hex_color(color: RGBColor) -> str:
     return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+
+def search_and_download_live_gif(query_words: list) -> io.BytesIO | None:
+    """Best-effort поиск GIF; сбой сети не должен ломать генерацию PPTX."""
+
+    try:
+        query = " ".join(str(word) for word in query_words[:6]) + " animated gif tech"
+        response = requests.post(
+            "https://duckduckgo.com",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=4,
+        )
+        links = re.findall(r"//external-content\.duckduckgo\.com/iu/\?u=[^&]+", response.text)
+        candidates = ["https:" + link for link in links if ".gif" in link.lower()]
+        if not candidates:
+            return None
+        image_response = requests.get(random.choice(candidates[:3]), timeout=4)
+        image_response.raise_for_status()
+        return io.BytesIO(image_response.content)
+    except (OSError, requests.RequestException, ValueError):
+        return None
+
+
+def generate_qr_code_stream(link: str) -> io.BytesIO:
+    """Создать PNG QR-кода для виджета учебного задания."""
+
+    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr.add_data(link or "https://education.yandex.ru/handbook")
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    stream.seek(0)
+    return stream
+
+
+def inject_styled_text_engine(paragraph, text: str, font_name: str, size_pt: int, default_color) -> None:
+    """Добавить текст runs с выделением ИТ-терминов по корням слов."""
+
+    paragraph.clear()
+    for word in text.split(" "):
+        if not word:
+            continue
+        run = paragraph.add_run()
+        run.text = word + " "
+        run.font.name = font_name
+        run.font.size = Pt(size_pt)
+        run.font.color.rgb = default_color
+        normalized = re.sub(r"[^\wа-яА-Я-ёЁ]", "", word).lower()
+        if any(root.lower() in normalized for root in KEYWORDS_TO_BOLD):
+            run.font.bold = True
 
 
 def text_box(slide, x, y, width, height, text, font=FONT_BODY, size=18,
@@ -412,7 +548,7 @@ def add_header(slide, title: str, accent: RGBColor) -> None:
     title_size = choose_font_size(title, header_zone, title_size, minimum=18)
     text_box(slide, Inches(1.0), Inches(0.4), Inches(11.333), Inches(1.0),
              title, font=FONT_HEADER, size=title_size, bold=True)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.0), Inches(1.4), Inches(1.0), Inches(0.08))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.0), Inches(1.3), Inches(1.0), Inches(0.02))
     bar.fill.solid()
     bar.fill.fore_color.rgb = accent
     bar.line.fill.background()
@@ -789,6 +925,8 @@ def build_presentation(dataset: list[dict[str, str]], palette: str, link: str) -
     blank = presentation.slide_layouts[6]
     layout_issues = []
     for index, data in enumerate(paginate_dataset(dataset)):
+        data = dict(data)
+        data["link"] = link
         slide = presentation.slides.add_slide(blank)
         render_slide(slide, data, accent, link, index)
         add_speaker_notes(slide, data)
@@ -799,6 +937,12 @@ def build_presentation(dataset: list[dict[str, str]], palette: str, link: str) -
     output = OUTPUT_DIR / f"generated_{uuid.uuid4().hex[:10]}.pptx"
     presentation.save(output)
     return output
+
+
+def build_presentation_industrial(dataset: list, chosen_palette: str, yandex_link: str) -> str:
+    """Совместимый публичный API промышленной сборки презентации."""
+
+    return str(build_presentation(dataset, chosen_palette, yandex_link))
 
 
 PALETTE_OPTIONS = "".join(
