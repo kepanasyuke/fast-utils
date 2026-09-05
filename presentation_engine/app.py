@@ -14,8 +14,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
 
@@ -56,6 +56,12 @@ def text_box(slide, x, y, width, height, text, font=FONT_BODY, size=18,
     frame = shape.text_frame
     frame.clear()
     frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    frame.margin_left = Inches(0.04)
+    frame.margin_right = Inches(0.04)
+    frame.margin_top = Inches(0.03)
+    frame.margin_bottom = Inches(0.03)
+    frame.vertical_anchor = MSO_ANCHOR.TOP
     paragraph = frame.paragraphs[0]
     paragraph.text = text
     paragraph.alignment = align
@@ -84,6 +90,18 @@ def qr_stream(link: str) -> io.BytesIO:
     return stream
 
 
+def extract_table(shape) -> list[list[str]]:
+    return [
+        [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells]
+        for row in shape.table.rows
+    ]
+
+
+def compact_title(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    return value if len(value) <= 84 else f"{' '.join(value.split()[:10])}..."
+
+
 def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
     try:
         presentation = Presentation(io.BytesIO(file_bytes))
@@ -92,16 +110,49 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
 
     result = []
     for index, slide in enumerate(presentation.slides):
-        texts = [shape.text.strip() for shape in slide.shapes
-                 if getattr(shape, "has_text_frame", False) and shape.text.strip()]
-        if not texts:
+        lines = []
+        tables = []
+        images = []
+        for shape in slide.shapes:
+            if getattr(shape, "has_table", False):
+                tables.append(extract_table(shape))
+            elif getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE:
+                images.append(shape.image.blob)
+            elif getattr(shape, "has_text_frame", False):
+                for paragraph in shape.text_frame.paragraphs:
+                    line = re.sub(r"\s+", " ", paragraph.text).strip()
+                    if line:
+                        prefix = "• " if paragraph.level else ""
+                        lines.append(prefix + line)
+        if not lines and not tables and not images:
             continue
-        title = texts[0]
-        body = "\n".join(texts[1:]) or title
+        title = lines[0] if lines else "Визуальный материал"
+        body_lines = lines[1:]
+
+        # Many PowerPoint files keep the title and the entire body in one text box.
+        # Split the first sentence so a paragraph cannot become a giant title.
+        if len(title) > 90:
+            sentence = re.split(r"(?<=[.!?])\s+", title, maxsplit=1)
+            if len(sentence) == 2 and len(sentence[0]) >= 18:
+                title, first_body = sentence
+            else:
+                words = title.split()
+                title = " ".join(words[:9]) + ("..." if len(words) > 9 else "")
+                first_body = " ".join(words[9:])
+            if first_body:
+                body_lines.insert(0, first_body)
+        title = compact_title(title)
+        body = "\n".join(body_lines).strip() or title
         lower = f"{title} {body}".lower()
         if index == 0:
             slide_type = "title_root"
-        elif any(token in lower for token in ("def ", "import ", "print(", "python", "код")):
+        elif tables:
+            slide_type = "table_dashboard"
+        elif len(images) >= 2:
+            slide_type = "image_collage"
+        elif images:
+            slide_type = "image_story"
+        elif re.search(r"\b(def|class|import|from|return|for|while)\b|[{}]|print\s*\(", lower):
             slide_type = "code_dark_ide" if index % 2 else "code_light_ide"
         elif any(token in lower for token in ("задание", "тест", "вопрос", "практика", "?")):
             slide_type = "yandex_interactive" if index % 2 else "classic_timer"
@@ -111,21 +162,79 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
             slide_type = "step_timeline"
         elif any(token in lower for token in ("git", "репозитор", "коммит", "ветка")):
             slide_type = "git_workflow"
+        elif len(body_lines) >= 4:
+            slide_type = "key_points"
         elif len(body) < 100:
-            slide_type = "minimal_quote"
+            slide_type = "minimal_quote" if index % 2 else "accent_statement"
+        elif len(body) > 280:
+            slide_type = "content_overview"
         else:
-            slide_type = "split_comparison"
-        result.append({"title": title, "body": body, "type": slide_type})
+            slide_type = ("split_comparison", "process_map", "accent_statement")[index % 3]
+        result.append({
+            "title": title,
+            "body": body,
+            "type": slide_type,
+            "table": tables[0] if tables else [],
+            "images": images,
+        })
     return result
 
 
 def add_header(slide, title: str, accent: RGBColor) -> None:
-    text_box(slide, Inches(0.85), Inches(0.42), Inches(11.6), Inches(0.7),
-             title, font=FONT_HEADER, size=30, bold=True)
+    title_size = 30 if len(title) < 48 else 24 if len(title) < 78 else 20
+    text_box(slide, Inches(0.85), Inches(0.35), Inches(11.6), Inches(0.75),
+             title, font=FONT_HEADER, size=title_size, bold=True)
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.85), Inches(1.2), Inches(1.0), Inches(0.08))
     bar.fill.solid()
     bar.fill.fore_color.rgb = accent
     bar.line.fill.background()
+
+
+def add_table_visual(slide, values: list[list[str]], accent: RGBColor) -> None:
+    if not values:
+        return
+    rows = len(values)
+    columns = max(len(row) for row in values)
+    table_shape = slide.shapes.add_table(
+        rows, columns, Inches(0.95), Inches(1.8), Inches(11.45), Inches(4.85)
+    )
+    table = table_shape.table
+    for column in range(columns):
+        table.columns[column].width = Inches(11.45 / columns)
+    for row_index, row in enumerate(values):
+        for column_index in range(columns):
+            cell = table.cell(row_index, column_index)
+            cell.text = row[column_index] if column_index < len(row) else ""
+            cell.margin_left = Inches(0.12)
+            cell.margin_right = Inches(0.12)
+            cell.margin_top = Inches(0.08)
+            cell.margin_bottom = Inches(0.08)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = accent if row_index == 0 else (LIGHT if row_index % 2 else WHITE)
+            for paragraph in cell.text_frame.paragraphs:
+                paragraph.font.name = FONT_HEADER if row_index == 0 else FONT_BODY
+                paragraph.font.size = Pt(13 if row_index == 0 else 12)
+                paragraph.font.bold = row_index == 0
+                paragraph.font.color.rgb = WHITE if row_index == 0 else TEXT
+                paragraph.alignment = PP_ALIGN.LEFT
+
+
+def add_picture_frame(slide, image_blob: bytes, x, y, width, height, accent: RGBColor) -> None:
+    frame = card(slide, x - Inches(0.08), y - Inches(0.08), width + Inches(0.16), height + Inches(0.16), WHITE, accent)
+    frame.shadow.inherit = False
+    slide.shapes.add_picture(io.BytesIO(image_blob), x, y, width=width, height=height)
+
+
+def add_image_placeholder(slide, x, y, width, height, accent: RGBColor) -> None:
+    placeholder = card(slide, x, y, width, height, LIGHT, accent)
+    text_frame = placeholder.text_frame
+    text_frame.text = "ВИЗУАЛЬНЫЙ АКЦЕНТ"
+    paragraph = text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    paragraph.font.name = FONT_HEADER
+    paragraph.font.size = Pt(13)
+    paragraph.font.bold = True
+    paragraph.font.color.rgb = accent
 
 
 def render_slide(slide, data: dict[str, str], accent: RGBColor, link: str, index: int) -> None:
@@ -137,15 +246,75 @@ def render_slide(slide, data: dict[str, str], accent: RGBColor, link: str, index
     if kind == "title_root":
         stripe = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.45), SLIDE_HEIGHT)
         stripe.fill.solid(); stripe.fill.fore_color.rgb = accent; stripe.line.fill.background()
-        card(slide, Inches(1.4), Inches(1.75), Inches(10.5), Inches(3.9), LIGHT, BORDER)
-        text_box(slide, Inches(1.8), Inches(2.45), Inches(9.7), Inches(1.1), title,
-                 font=FONT_HEADER, size=42, bold=True, align=PP_ALIGN.CENTER)
-        text_box(slide, Inches(2.1), Inches(3.85), Inches(9.1), Inches(1.0), body,
-                 size=17, color=MUTED, align=PP_ALIGN.CENTER)
+        card(slide, Inches(1.4), Inches(1.55), Inches(10.5), Inches(4.45), LIGHT, BORDER)
+        title_size = 42 if len(title) < 32 else 34 if len(title) < 58 else 27
+        text_box(slide, Inches(1.8), Inches(2.15), Inches(9.7), Inches(1.55), title,
+             font=FONT_HEADER, size=title_size, bold=True, align=PP_ALIGN.CENTER)
+        text_box(slide, Inches(2.1), Inches(3.95), Inches(9.1), Inches(1.45), body,
+             size=16 if len(body) < 120 else 13, color=MUTED, align=PP_ALIGN.CENTER)
         return
 
     add_header(slide, title, accent)
-    if kind in ("code_dark_ide", "code_light_ide"):
+    if kind == "table_dashboard":
+        text_box(slide, Inches(0.95), Inches(1.42), Inches(11.45), Inches(0.28),
+                 "Данные собраны в единую визуальную систему", size=11, color=MUTED)
+        add_table_visual(slide, data.get("table", []), accent)
+    elif kind == "image_collage":
+        images = data.get("images", [])
+        slots = [
+            (Inches(0.95), Inches(1.8), Inches(5.25), Inches(4.7)),
+            (Inches(6.65), Inches(1.8), Inches(2.45), Inches(2.15)),
+            (Inches(9.45), Inches(4.05), Inches(2.95), Inches(2.45)),
+        ]
+        for image, slot in zip(images[:3], slots):
+            add_picture_frame(slide, image, *slot, accent)
+        if len(images) < 3:
+            add_image_placeholder(slide, *slots[len(images)], accent)
+        text_box(slide, Inches(6.7), Inches(2.35), Inches(2.1), Inches(0.85), data["body"],
+                 size=13, color=MUTED)
+    elif kind == "image_story":
+        image = data.get("images", [None])[0]
+        if image:
+            add_picture_frame(slide, image, Inches(0.95), Inches(1.75), Inches(6.1), Inches(4.9), accent)
+        else:
+            add_image_placeholder(slide, Inches(0.95), Inches(1.75), Inches(6.1), Inches(4.9), accent)
+        card(slide, Inches(7.55), Inches(1.75), Inches(4.8), Inches(4.9), LIGHT, BORDER)
+        text_box(slide, Inches(7.95), Inches(2.25), Inches(4.0), Inches(3.8), data["body"],
+                 size=17 if len(data["body"]) < 260 else 14, color=MUTED)
+    elif kind == "key_points":
+        card(slide, Inches(0.95), Inches(1.75), Inches(11.45), Inches(4.9), LIGHT, BORDER)
+        points = [line.strip("• ") for line in data["body"].splitlines() if line.strip()]
+        for point_index, point in enumerate(points[:7]):
+            y = 2.15 + point_index * 0.6
+            marker = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(1.35), Inches(y + 0.04), Inches(0.24), Inches(0.24))
+            marker.fill.solid(); marker.fill.fore_color.rgb = accent; marker.line.fill.background()
+            text_box(slide, Inches(1.8), Inches(y), Inches(10.0), Inches(0.48), point,
+                     size=15 if len(point) < 100 else 12, color=TEXT)
+    elif kind == "accent_statement":
+        stripe = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.95), Inches(1.8), Inches(0.28), Inches(4.8))
+        stripe.fill.solid(); stripe.fill.fore_color.rgb = accent; stripe.line.fill.background()
+        text_box(slide, Inches(1.7), Inches(2.15), Inches(10.2), Inches(0.45), "ГЛАВНАЯ МЫСЛЬ",
+                 font=FONT_HEADER, size=15, color=accent, bold=True)
+        text_box(slide, Inches(1.7), Inches(2.85), Inches(10.1), Inches(2.4), body,
+                 font=FONT_HEADER, size=30 if len(body) < 140 else 21,
+                 color=TEXT, bold=True)
+    elif kind == "process_map":
+        steps = [part.strip(" •") for part in re.split(r"\n|(?<=[.!?])\s+", body) if part.strip()][:4]
+        for step_index, step in enumerate(steps):
+            x = Inches(0.95 + (step_index % 2) * 6.0)
+            y = Inches(1.85 + (step_index // 2) * 2.45)
+            card(slide, x, y, Inches(5.25), Inches(1.75), LIGHT if step_index % 2 else WHITE, accent)
+            text_box(slide, x + Inches(0.28), y + Inches(0.22), Inches(0.55), Inches(0.4),
+                     f"{step_index + 1:02d}", font=FONT_HEADER, size=18, color=accent, bold=True)
+            text_box(slide, x + Inches(1.0), y + Inches(0.24), Inches(3.9), Inches(1.2), step,
+                     size=14 if len(step) < 110 else 11, color=TEXT)
+    elif kind == "content_overview":
+        card(slide, Inches(0.95), Inches(1.75), Inches(11.45), Inches(4.9), LIGHT, BORDER)
+        text_box(slide, Inches(1.35), Inches(2.2), Inches(10.5), Inches(0.4), "ОБЗОР МАТЕРИАЛА",
+                 font=FONT_HEADER, size=15, color=accent, bold=True)
+        text_box(slide, Inches(1.35), Inches(2.85), Inches(10.4), Inches(3.1), body,
+                 size=14 if len(body) < 650 else 11, color=TEXT)
+    elif kind in ("code_dark_ide", "code_light_ide"):
         fill = TERMINAL if kind == "code_dark_ide" else LIGHT
         color = WHITE if kind == "code_dark_ide" else TEXT
         card(slide, Inches(0.9), Inches(1.75), Inches(6.3), Inches(4.8), fill, accent, False)
@@ -190,12 +359,11 @@ def render_slide(slide, data: dict[str, str], accent: RGBColor, link: str, index
         text_box(slide, Inches(1.0), Inches(2.2), Inches(11.0), Inches(2.8), f'« {body} »',
                  font=FONT_HEADER, size=30, color=accent, bold=True, align=PP_ALIGN.CENTER)
     else:
-        card(slide, Inches(0.9), Inches(1.8), Inches(6.0), Inches(4.7), LIGHT, BORDER)
-        card(slide, Inches(7.25), Inches(1.8), Inches(5.1), Inches(4.7), WHITE, accent)
-        text_box(slide, Inches(1.35), Inches(2.3), Inches(5.1), Inches(0.5), "КОНТЕКСТ", font=FONT_HEADER, size=15, color=accent, bold=True)
-        text_box(slide, Inches(1.35), Inches(3.0), Inches(5.0), Inches(2.5), body, size=17, color=MUTED)
-        text_box(slide, Inches(7.75), Inches(2.4), Inches(4.1), Inches(1.5), "Единый дизайн-код", font=FONT_HEADER, size=24, color=TEXT, bold=True)
-        text_box(slide, Inches(7.75), Inches(4.0), Inches(4.0), Inches(1.2), "Структура, акцент и ритм работают вместе.", size=16, color=MUTED)
+        card(slide, Inches(0.9), Inches(1.8), Inches(11.5), Inches(4.9), LIGHT, accent)
+        text_box(slide, Inches(1.35), Inches(2.25), Inches(10.5), Inches(0.5), "КОНТЕКСТ", font=FONT_HEADER, size=15, color=accent, bold=True)
+        body_size = 17 if len(body) < 300 else 14
+        text_box(slide, Inches(1.35), Inches(2.95), Inches(10.5), Inches(3.2), body,
+             size=body_size, color=MUTED)
 
 
 def build_presentation(dataset: list[dict[str, str]], palette: str, link: str) -> Path:
