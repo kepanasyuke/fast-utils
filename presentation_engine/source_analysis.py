@@ -213,7 +213,9 @@ def analyze_slide(slide, slide_width: float = 13.333, slide_height: float = 7.5)
                 has_bullets=any(p.level > 0 for p in paragraphs),
                 z_order=z_order,
             ))
-        elif shape_type in (MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.AUTO_SHAPE):
+        elif shape_type == MSO_SHAPE_TYPE.LINE:
+            profile.elements.append(SourceElement(ElementKind.CONNECTOR, bounds, z_order=z_order))
+        elif shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
             profile.elements.append(SourceElement(ElementKind.SHAPE, bounds, z_order=z_order))
     return profile
 

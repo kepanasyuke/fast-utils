@@ -8,45 +8,45 @@ import re
 import uuid
 from pathlib import Path
 
-import qrcode
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
-from PIL import Image, ImageOps
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
+from config import MAX_UPLOAD_BYTES, OUTPUT_DIR as CONFIG_OUTPUT_DIR
+from design_system import COLORS, FONTS
 from layout_engine import (
     Rect,
     TextBlock,
     choose_font_size,
-    estimate_text_height,
     split_text_to_fit,
     validate_rect,
 )
 from source_analysis import analyze_slide, choose_source_template
+from utils import create_qr, safe_fit_image
 
 
 app = FastAPI(title="AI Presentation Brand Engine")
-OUTPUT_DIR = Path(__file__).resolve().parent / "generated_presentations"
+OUTPUT_DIR = CONFIG_OUTPUT_DIR
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 SLIDE_WIDTH = Inches(13.333)
 SLIDE_HEIGHT = Inches(7.5)
 SLIDE_CANVAS = Rect(0, 0, 13.333, 7.5)
-FONT_HEADER = "Segoe UI"
-FONT_BODY = "Verdana"
-FONT_CODE = "Consolas"
+FONT_HEADER = FONTS["header"]
+FONT_BODY = FONTS["body"]
+FONT_CODE = FONTS["code"]
 
-WHITE = RGBColor(255, 255, 255)
-TEXT = RGBColor(21, 30, 47)
-MUTED = RGBColor(85, 101, 126)
-LIGHT = RGBColor(248, 250, 252)
-BORDER = RGBColor(226, 232, 240)
-TERMINAL = RGBColor(13, 19, 33)
+WHITE = COLORS["white"]
+TEXT = COLORS["text"]
+MUTED = COLORS["muted"]
+LIGHT = COLORS["light"]
+BORDER = COLORS["border"]
+TERMINAL = COLORS["terminal"]
 PALETTES = {
     "cyber_blue": RGBColor(6, 182, 212),
     "matrix_green": RGBColor(16, 185, 129),
@@ -56,6 +56,107 @@ PALETTES = {
     "git_orange": RGBColor(249, 115, 22),
     "ai_purple": RGBColor(139, 92, 246),
 }
+
+
+class LayoutGridEngine:
+    """Контекстный выбор макета без циклического перебора шаблонов."""
+
+    CLASSES = {
+        "A": tuple(f"A-{index:02d}" for index in range(1, 13)),
+        "B": tuple(f"B-{index:02d}" for index in range(13, 25)),
+        "C": tuple(f"C-{index:02d}" for index in range(25, 37)),
+        "D": tuple(f"D-{index:02d}" for index in range(37, 49)),
+        "E": tuple(f"E-{index:02d}" for index in range(49, 61)),
+    }
+    SAFE_ZONES = {
+        "left": (1.0, 1.8, 5.8, 4.5),
+        "right": (7.6, 1.8, 4.733, 4.5),
+        "center": (1.666, 1.8, 10.0, 4.5),
+    }
+    CODE_MARKERS = ("print(", "def ", "for ", "while ", "import ", " = ", "{", "}", "writeln")
+    INTERACTIVE_MARKERS = ("?", "задание", "тест", "вопрос", "решите", "найдите", "практика")
+    DEFINITION_MARKERS = ("— это", "- это", "называется", "означает", "под термином", "является")
+    TIMELINE_MARKERS = ("этап", "шаг", "последовательность", "году", "в 19", "в 20")
+
+    @classmethod
+    def analyze_and_score_source(cls, slide_data: dict) -> dict[str, object]:
+        """Вернуть scores, класс и конкретный ID из 60 шаблонов."""
+
+        body = str(slide_data.get("full_body", slide_data.get("body", "")))
+        title = str(slide_data.get("title", ""))
+        text = f"{title}\n{body}".lower()
+        scores = {key: 0 for key in cls.CLASSES}
+        evidence = {key: [] for key in cls.CLASSES}
+
+        for marker in cls.CODE_MARKERS:
+            if marker in text:
+                scores["A"] += 10
+                evidence["A"].append(marker)
+        for marker in cls.INTERACTIVE_MARKERS:
+            if marker in text:
+                scores["B"] += 10
+                evidence["B"].append(marker)
+        for marker in cls.DEFINITION_MARKERS:
+            if marker in text:
+                scores["C"] += 10
+                evidence["C"].append(marker)
+        if re.search(r"(?:^|\n)\s*(?:\d+[.)]|[-•])\s+", body) or any(marker in text for marker in cls.TIMELINE_MARKERS):
+            scores["D"] += 10
+            evidence["D"].append("список/дата/этап")
+        if len(body.strip()) < 80 and not scores["A"]:
+            scores["E"] += 10
+            evidence["E"].append("короткий текст")
+
+        source_profile = slide_data.get("source_profile")
+        if source_profile is not None:
+            if getattr(source_profile, "table_elements", []):
+                scores["D"] += 6
+                evidence["D"].append("таблица")
+            if getattr(source_profile, "image_elements", []):
+                scores["E"] += 4
+                evidence["E"].append("изображение")
+            if getattr(source_profile, "connector_count", 0) >= 2:
+                scores["D"] += 8
+                evidence["D"].append("соединители")
+
+        best_score = max(scores.values())
+        if best_score == 0:
+            winning_class = "E" if len(body) < 180 else "D"
+        else:
+            winning_class = max(scores, key=lambda key: (scores[key], -ord(key)))
+
+        # Вариация зависит от доказательств и индекса, но не от циклического списка типов.
+        fingerprint = sum(ord(char) for char in f"{title}|{body[:240]}")
+        variation = (fingerprint + int(slide_data.get("source_index", 0))) % 12
+        template_id = cls.CLASSES[winning_class][variation]
+        index = int(slide_data.get("source_index", 0))
+        return {
+            "scores": scores,
+            "evidence": evidence,
+            "class": winning_class,
+            "template_id": template_id,
+            "variation": variation + 1,
+            "mode": "mirror-dark" if index % 2 == 0 else "direct-light",
+            "safe_zones": cls.SAFE_ZONES,
+        }
+
+    @classmethod
+    def apply_semantic_choice(cls, slide_data: dict) -> dict:
+        choice = cls.analyze_and_score_source(slide_data)
+        slide_data["semantic_layout"] = choice
+        return slide_data
+
+    @staticmethod
+    def summary_text(text: str, limit: int = 350) -> tuple[str, str]:
+        """Вернуть короткий текст слайда и полный текст для заметок."""
+
+        if len(text) <= limit:
+            return text, ""
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+        summary = " ".join(sentences[:3]).strip()
+        if not summary:
+            summary = text[:limit].rsplit(" ", 1)[0]
+        return summary, text[len(summary):].strip()
 
 
 def hex_color(color: RGBColor) -> str:
@@ -95,11 +196,7 @@ def card(slide, x, y, width, height, fill=WHITE, line=BORDER, radius=True):
 
 
 def qr_stream(link: str) -> io.BytesIO:
-    image = qrcode.make(link or "https://education.yandex.ru/handbook")
-    stream = io.BytesIO()
-    image.save(stream, format="PNG")
-    stream.seek(0)
-    return stream
+    return create_qr(link)
 
 
 def extract_table(shape) -> list[list[str]]:
@@ -153,19 +250,7 @@ def classify_educational_slide(title: str, text: str, blocks: list[str]) -> str 
 
 
 def prepare_image(blob: bytes, width: int, height: int) -> io.BytesIO:
-    try:
-        image = Image.open(io.BytesIO(blob)).convert("RGBA")
-        fitted = ImageOps.contain(image, (width, height), method=Image.Resampling.LANCZOS)
-        canvas = Image.new("RGBA", (width, height), (255, 255, 255, 255))
-        canvas.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
-        stream = io.BytesIO()
-        canvas.save(stream, format="PNG", optimize=True)
-        stream.seek(0)
-        return stream
-    except (OSError, ValueError):
-        # PowerPoint can carry WMF/EMF vector art that Pillow cannot decode.
-        # Keep the original bytes so python-pptx preserves the source artwork.
-        return io.BytesIO(blob)
+    return safe_fit_image(blob, width, height)
 
 
 def iter_shapes(shapes):
@@ -219,6 +304,7 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
         title = compact_title(title)
         blocks = split_content_blocks(body_lines)
         body = "\n".join(blocks).strip() or title
+        display_body, notes_body = LayoutGridEngine.summary_text(body)
         lower = f"{title} {body}".lower()
         educational_type = classify_educational_slide(title, body, blocks)
         source_type = choose_source_template(source_profile, title, body)
@@ -258,14 +344,28 @@ def parse_slides(file_bytes: bytes) -> list[dict[str, str]]:
             slide_type = ("split_comparison", "process_map", "accent_statement")[index % 3]
         result.append({
             "title": title,
-            "body": body,
-            "blocks": blocks,
+            "body": display_body,
+            "full_body": body,
+            "notes_body": notes_body,
+            "blocks": split_content_blocks(display_body.splitlines()),
             "type": slide_type,
             "table": tables[0] if tables else [],
             "tables": tables,
             "images": images,
             "source_profile": source_profile,
+            "source_index": index,
         })
+        semantic_choice = LayoutGridEngine.analyze_and_score_source(result[-1])
+        result[-1]["semantic_layout"] = semantic_choice
+        if not tables and not images and slide_type != "title_root":
+            semantic_kind = {
+                "A": "code_dark_ide" if index % 2 == 0 else "code_light_ide",
+                "B": "exercise_card",
+                "C": "big_definition",
+                "D": "flowchart",
+                "E": "accent_statement",
+            }[semantic_choice["class"]]
+            result[-1]["type"] = semantic_kind
     return result
 
 
@@ -307,14 +407,25 @@ def paginate_dataset(dataset: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def add_header(slide, title: str, accent: RGBColor) -> None:
-    header_zone = Rect(0.85, 0.35, 11.6, 0.75)
-    title_size = choose_font_size(title, header_zone, 30, minimum=18)
-    text_box(slide, Inches(0.85), Inches(0.35), Inches(11.6), Inches(0.75),
+    header_zone = Rect(1.0, 0.4, 11.333, 1.0)
+    title_size = 22 if len(title) > 45 else 32
+    title_size = choose_font_size(title, header_zone, title_size, minimum=18)
+    text_box(slide, Inches(1.0), Inches(0.4), Inches(11.333), Inches(1.0),
              title, font=FONT_HEADER, size=title_size, bold=True)
-    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.85), Inches(1.2), Inches(1.0), Inches(0.08))
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.0), Inches(1.4), Inches(1.0), Inches(0.08))
     bar.fill.solid()
     bar.fill.fore_color.rgb = accent
     bar.line.fill.background()
+
+
+def add_speaker_notes(slide, data: dict[str, str]) -> None:
+    """Store omitted source text in speaker notes without cluttering the slide."""
+
+    notes_body = data.get("notes_body", "").strip()
+    if not notes_body:
+        return
+    notes_frame = slide.notes_slide.notes_text_frame
+    notes_frame.text = "Подробный материал исходного слайда:\n\n" + notes_body
 
 
 def add_table_visual(slide, values: list[list[str]], accent: RGBColor) -> None:
@@ -495,6 +606,11 @@ def add_exercise_layout(slide, data: dict[str, str], accent: RGBColor, index: in
              font=FONT_HEADER, size=14, color=accent, bold=True, align=PP_ALIGN.CENTER)
     text_box(slide, Inches(9.9), Inches(3.15), Inches(2.05), Inches(1.5),
              "Сформулируйте ответ\nи обсудите ход решения.", size=15, color=MUTED, align=PP_ALIGN.CENTER)
+    timer = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(9.82), Inches(5.1), Inches(2.2), Inches(0.72))
+    timer.fill.solid(); timer.fill.fore_color.rgb = TERMINAL; timer.line.color.rgb = accent
+    text_box(slide, Inches(9.98), Inches(5.25), Inches(1.9), Inches(0.35), "ВРЕМЯ ПОШЛО · 02:00",
+             font=FONT_HEADER, size=11, color=WHITE, bold=True, align=PP_ALIGN.CENTER)
+    slide.shapes.add_picture(qr_stream(data.get("link", "")), Inches(10.42), Inches(1.95), Inches(1.0), Inches(1.0))
 
 
 def add_solution_layout(slide, data: dict[str, str], accent: RGBColor) -> None:
@@ -675,6 +791,7 @@ def build_presentation(dataset: list[dict[str, str]], palette: str, link: str) -
     for index, data in enumerate(paginate_dataset(dataset)):
         slide = presentation.slides.add_slide(blank)
         render_slide(slide, data, accent, link, index)
+        add_speaker_notes(slide, data)
         layout_issues.extend((index + 1, issue) for issue in validate_slide_geometry(slide))
     if layout_issues:
         issue_preview = "; ".join(f"слайд {index}: {message}" for index, message in layout_issues[:5])
@@ -721,6 +838,8 @@ async def engine_process(
     if not file.filename or not file.filename.lower().endswith(".pptx"):
         raise HTTPException(status_code=400, detail="Загрузите файл в формате .pptx.")
     data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Файл презентации слишком большой.")
     slides = parse_slides(data)
     if not slides:
         raise HTTPException(status_code=400, detail="В презентации не найден текстовый контент.")
